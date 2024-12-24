@@ -78,8 +78,8 @@ union_df.sort_values(['symbol', 'time'], inplace=True)
 
 # List of symbols to exclude
 symbols_to_exclude = ['USTUSD', 'USTUSDC', 'USTUSDT', 'USDCUSD', 'USDCUSDT', 'USDCAUD', 'USDCCAD', 'USDCCHF', 'USDCEUR', 'USDCGBP', 'USDCHF', 
-                      'DAIUSD', 'DAIUSDT', 'DOTUSDT', 'ETHUSDT', 'ETHWUSD', 'ADAUSDT', 'PYUSDUSD', 'ZUSDZCAD', 'TUSDUSD','USDTAUD', 'PYUSDEUR', 
-                      'USDTEUR', 'USDTJPY', 'ZGBPZUSD', 'ZEURZUSD', 'EURTUSDT', 'USDTGBP','LUNAUSD']
+                      'DAIUSD', 'DAIUSDT', 'DOTUSDT', 'ETHUSDT', 'ETHWUSD', 'PYUSDUSD', 'ZUSDZCAD', 'TUSDUSD','USDTAUD', 'PYUSDEUR', 
+                      'USDTEUR', 'USDTJPY', 'ZGBPZUSD', 'ZEURZUSD', 'EURTUSDT', 'USDTGBP']
 
 # Create a boolean mask based on symbols_to_exclude
 mask = ~union_df['symbol'].isin(symbols_to_exclude)
