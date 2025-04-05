@@ -35,14 +35,14 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
     bytes32[] private activeWithdrawalKeys;
 
-    uint256 public constant MINT_PRICE = 0.1 ether;
+    uint256 public mintPrice = 0.1 ether;
     uint256 public constant MIN_DELAY = 1 minutes;
     uint256 public constant MAX_DELAY = 720 minutes;
     uint256 public constant BASE_PROCESS_TIME = 60 minutes;
-    uint256 public constant WITHDRAWAL_FEE = 0.001 ether;
     uint256 public constant RETRY_INTERVAL = 24 hours;
     uint8 public constant MAX_RETRY_ATTEMPTS = 7;
 
+    uint256 public feeBasisPoints = 50; // 0.5%
     address constant FEE_RECIPIENT = 0xDCeCF114cdA49c2bf264181065c46aa786A4d084;
 
     event Minted(address indexed user, uint256 amount);
@@ -54,8 +54,12 @@ contract ANONToken is ERC20, ReentrancyGuard {
         lastProcessedTime = block.timestamp;
     }
 
+    function calculateFee(uint256 amount) public view returns (uint256) {
+        return (amount * feeBasisPoints) / 10000;
+    }
+
     function mint() external payable nonReentrant {
-        require(msg.value == MINT_PRICE, "Must send exactly 0.1 ETH");
+        require(msg.value == mintPrice, "Incorrect ETH amount sent");
         require(block.number > lastProcessedTime + 1, "Too soon after last mint");
         updateGasHistory();
         _mint(msg.sender, 1);
@@ -75,7 +79,8 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
     function requestBurn(bytes32 stealthHash, address stealthRecipient, bytes memory signature, uint256 userEntropy) external payable nonReentrant {
         require(balanceOf(msg.sender) >= 1, "Insufficient ANON balance");
-        require(msg.value >= estimateGasCost() + WITHDRAWAL_FEE, "Insufficient gas fee");
+        uint256 dynamicFee = calculateFee(msg.value);
+        require(msg.value >= estimateGasCost() + dynamicFee, "Insufficient gas fee");
         require(stealthRecipient != address(0), "Invalid recipient");
         require(registeredStealthAddresses[stealthHash], "Stealth address not registered");
 
@@ -138,10 +143,11 @@ contract ANONToken is ERC20, ReentrancyGuard {
             numProcessed++;
             totalProcessedWithdrawals++;
 
+            uint256 dynamicFee = calculateFee(withdrawal.amount);
             uint256 estimatedGasCost = estimateGasCost();
-            uint256 refundAmount = (withdrawal.amount >= estimatedGasCost) ? withdrawal.amount - estimatedGasCost : 0;
+            uint256 refundAmount = (withdrawal.amount >= estimatedGasCost + dynamicFee) ? withdrawal.amount - estimatedGasCost - dynamicFee : 0;
 
-            (bool feeSuccess, ) = payable(FEE_RECIPIENT).call{value: WITHDRAWAL_FEE}("");
+            (bool feeSuccess, ) = payable(FEE_RECIPIENT).call{value: dynamicFee}("");
             require(feeSuccess, "Fee transfer failed");
 
             (bool success, ) = withdrawal.recipient.call{value: refundAmount}("");
@@ -166,7 +172,6 @@ contract ANONToken is ERC20, ReentrancyGuard {
                 }
             }
 
-            // Prune from activeWithdrawalKeys
             for (uint256 i = 0; i < activeWithdrawalKeys.length; i++) {
                 if (activeWithdrawalKeys[i] == commitmentHash) {
                     activeWithdrawalKeys[i] = activeWithdrawalKeys[activeWithdrawalKeys.length - 1];
@@ -242,7 +247,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
             sum += gasPriceHistory[i];
         }
         uint256 avgGasPrice = sum / GAS_HISTORY;
-        uint256 adjustedGasPrice = avgGasPrice + (avgGasPrice / 4); // 25% buffer
+        uint256 adjustedGasPrice = avgGasPrice + (avgGasPrice / 4);
         return 300000 * (tx.gasprice > adjustedGasPrice ? tx.gasprice : adjustedGasPrice);
     }
 
