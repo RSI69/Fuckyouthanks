@@ -72,7 +72,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
     }
 
     function registerStealthAddress(bytes32 stealthHash, bytes32[] calldata proof) external {
-        require(balanceOf(msg.sender) > 0, "Must own ANON to register stealth address");
+        require(balanceOf(msg.sender) >= 1, "Must own at least 1 ANON to register stealth address");
         require(MerkleProof.verify(proof, merkleRoot, stealthHash), "Invalid stealth address proof");
         registeredStealthAddresses[stealthHash] = true;
     }
