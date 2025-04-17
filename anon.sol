@@ -22,6 +22,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
     mapping(bytes32 => bool) private processedWithdrawals;
     mapping(address => uint256) private nonces;
     mapping(bytes32 => bool) private registeredStealthAddresses;
+    mapping(bytes32 => uint256) private activeKeyIndex;
 
     bytes32 public merkleRoot;
     uint256 public lastProcessedTime;
@@ -35,15 +36,17 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
     bytes32[] private activeWithdrawalKeys;
 
-    uint256 public mintPrice = 0.1 ether;
+    uint256 public immutable mintPrice = 0.1 ether;
     uint256 public constant MIN_DELAY = 1 minutes;
     uint256 public constant MAX_DELAY = 720 minutes;
     uint256 public constant BASE_PROCESS_TIME = 60 minutes;
     uint256 public constant RETRY_INTERVAL = 24 hours;
     uint8 public constant MAX_RETRY_ATTEMPTS = 7;
 
-    uint256 public feeBasisPoints = 50; // 0.5%
+    uint256 public immutable feeBasisPoints = 50; // 0.5%
     address constant FEE_RECIPIENT = 0xDCeCF114cdA49c2bf264181065c46aa786A4d084;
+
+    uint256 public constant MIN_ANONYMITY_SET = 50;
 
     event Minted(address indexed user, uint256 amount);
     event MerkleRootUpdated(bytes32 newRoot);
@@ -66,7 +69,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         emit Minted(msg.sender, 1);
         lastProcessedTime = block.timestamp;
 
-        if (withdrawalStart < withdrawalEnd) {
+        if ((withdrawalEnd - withdrawalStart) >= MIN_ANONYMITY_SET) {
             processWithdrawals(1);
         }
     }
@@ -88,7 +91,9 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
         bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, stealthHash, address(this), nonces[msg.sender], block.chainid));
         bytes32 ethSignedMessage = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
-        require(ECDSA.recover(ethSignedMessage, signature) == msg.sender, "Invalid signature");
+        address signer = ECDSA.recover(ethSignedMessage, signature);
+        require(signer != address(0), "Zero address signature");
+        require(signer == msg.sender, "Invalid signature");
         nonces[msg.sender]++;
 
         uint256 randomDelay = secureRandomDelay(userEntropy);
@@ -105,6 +110,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         withdrawalQueue[withdrawalEnd] = commitmentHash;
         withdrawalEnd++;
 
+        activeKeyIndex[commitmentHash] = activeWithdrawalKeys.length;
         activeWithdrawalKeys.push(commitmentHash);
 
         _burn(msg.sender, 1);
@@ -113,7 +119,9 @@ contract ANONToken is ERC20, ReentrancyGuard {
             updateMerkleRoot();
         }
 
-        processWithdrawals(5);
+        if ((withdrawalEnd - withdrawalStart) >= MIN_ANONYMITY_SET) {
+            processWithdrawals(5);
+        }
     }
 
     function processWithdrawals(uint256 maxToProcess) internal nonReentrant {
@@ -130,12 +138,12 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
             if (processedWithdrawals[commitmentHash]) {
                 delete withdrawalQueue[withdrawalStart];
-                withdrawalStart++;
+                gotoNext();
                 continue;
             }
 
             if (block.timestamp < withdrawal.unlockTime || block.timestamp < withdrawal.lastAttempt + RETRY_INTERVAL) {
-                withdrawalStart++;
+                gotoNext();
                 continue;
             }
 
@@ -145,42 +153,48 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
             uint256 dynamicFee = calculateFee(withdrawal.amount);
             uint256 estimatedGasCost = estimateGasCost();
-            uint256 refundAmount = (withdrawal.amount >= estimatedGasCost + dynamicFee) ? withdrawal.amount - estimatedGasCost - dynamicFee : 0;
+            require(dynamicFee < withdrawal.amount, "Fee too high");
+            uint256 refundAmount = withdrawal.amount - estimatedGasCost - dynamicFee;
+            require(refundAmount > 0, "Nothing to refund");
 
-            (bool feeSuccess, ) = payable(FEE_RECIPIENT).call{value: dynamicFee}("");
+            bool success;
+            bool feeSuccess;
+
+            processedWithdrawals[commitmentHash] = true;
+            delete pendingWithdrawals[commitmentHash];
+            delete withdrawalQueue[withdrawalStart];
+
+            uint256 index = activeKeyIndex[commitmentHash];
+            uint256 last = activeWithdrawalKeys.length - 1;
+            if (index != last) {
+                bytes32 lastKey = activeWithdrawalKeys[last];
+                activeWithdrawalKeys[index] = lastKey;
+                activeKeyIndex[lastKey] = index;
+            }
+            activeWithdrawalKeys.pop();
+            delete activeKeyIndex[commitmentHash];
+
+            (feeSuccess, ) = payable(FEE_RECIPIENT).call{value: dynamicFee}("");
             require(feeSuccess, "Fee transfer failed");
 
-            (bool success, ) = withdrawal.recipient.call{value: refundAmount}("");
+            (success, ) = withdrawal.recipient.call{value: refundAmount}("");
 
-            if (success) {
-                processedWithdrawals[commitmentHash] = true;
-                delete pendingWithdrawals[commitmentHash];
-                delete withdrawalQueue[withdrawalStart];
-            } else {
-                withdrawal.retryCount++;
-                if (withdrawal.retryCount >= MAX_RETRY_ATTEMPTS) {
-                    processedWithdrawals[commitmentHash] = true;
-                    delete pendingWithdrawals[commitmentHash];
-                    delete withdrawalQueue[withdrawalStart];
+            if (!success) {
+                Withdrawal storage original = pendingWithdrawals[commitmentHash];
+                original.retryCount = withdrawal.retryCount + 1;
+
+                if (original.retryCount >= MAX_RETRY_ATTEMPTS) {
                     (bool fallbackSuccess, ) = payable(FEE_RECIPIENT).call{value: withdrawal.amount}("");
                     require(fallbackSuccess, "Fallback transfer failed");
                     emit WithdrawalSentToFeeRecipient(commitmentHash, withdrawal.amount);
                 } else {
                     withdrawalQueue[withdrawalEnd] = commitmentHash;
                     withdrawalEnd++;
-                    emit WithdrawalFailed(commitmentHash, withdrawal.recipient, refundAmount, withdrawal.retryCount);
+                    emit WithdrawalFailed(commitmentHash, withdrawal.recipient, refundAmount, original.retryCount);
                 }
             }
 
-            for (uint256 i = 0; i < activeWithdrawalKeys.length; i++) {
-                if (activeWithdrawalKeys[i] == commitmentHash) {
-                    activeWithdrawalKeys[i] = activeWithdrawalKeys[activeWithdrawalKeys.length - 1];
-                    activeWithdrawalKeys.pop();
-                    break;
-                }
-            }
-
-            withdrawalStart++;
+            gotoNext();
         }
 
         lastProcessedTime = block.timestamp;
@@ -196,6 +210,10 @@ contract ANONToken is ERC20, ReentrancyGuard {
             }
             withdrawalStart = cleanupLimit;
         }
+    }
+
+    function gotoNext() internal {
+        withdrawalStart++;
     }
 
     function updateMerkleRoot() internal {
@@ -216,8 +234,9 @@ contract ANONToken is ERC20, ReentrancyGuard {
         bytes32[] memory leaves = new bytes32[](tempLen);
         uint256 j = 0;
         for (uint256 i = 0; i < activeWithdrawalKeys.length; i++) {
-            if (!processedWithdrawals[activeWithdrawalKeys[i]]) {
-                leaves[j++] = keccak256(abi.encodePacked(activeWithdrawalKeys[i]));
+            bytes32 key = activeWithdrawalKeys[i];
+            if (!processedWithdrawals[key]) {
+                leaves[j++] = keccak256(abi.encodePacked(key));
             }
         }
 
@@ -252,6 +271,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
     }
 
     function secureRandomDelay(uint256 userInput) internal view returns (uint256) {
+        require(userInput > 0, "Entropy required");
         bytes32 hash = keccak256(abi.encodePacked(
             msg.sender,
             merkleRoot,
