@@ -64,7 +64,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         }
     }
 
-    function calculateFee(uint256 amount) public pure returns (uint256) {
+    function calculateFee(uint256 amount) public view returns (uint256) {
         return (amount * feeBasisPoints) / 10000;
     }
 
@@ -89,6 +89,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
     function requestBurn(bytes32 stealthHash, address stealthRecipient, bytes memory signature, uint256 userEntropy) external payable nonReentrant {
         require(balanceOf(msg.sender) >= 1, "Insufficient ANON balance");
+        require(msg.value >= 1e15, "Too small");
         uint256 dynamicFee = calculateFee(msg.value);
         require(msg.value >= estimateGasCost() + dynamicFee, "Insufficient gas fee");
         require(stealthRecipient != address(0), "Invalid recipient");
@@ -96,17 +97,18 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
         updateGasHistory();
 
-        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, stealthHash, address(this), nonces[msg.sender], block.chainid));
+        uint256 userNonce = nonces[msg.sender];
+
+        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, stealthHash, address(this), userNonce, block.chainid));
         bytes32 ethSignedMessage = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
         require(!usedSignatures[ethSignedMessage], "Signature already used");
         usedSignatures[ethSignedMessage] = true;
         address signer = ECDSA.recover(ethSignedMessage, signature);
         require(signer != address(0), "Zero address signature");
         require(signer == msg.sender, "Invalid signature");
-        nonces[msg.sender]++;
 
-        uint256 randomDelay = secureRandomDelay(userEntropy);
-        bytes32 commitmentHash = keccak256(abi.encodePacked(stealthHash, msg.sender, block.prevrandao, block.timestamp, nonces[msg.sender]));
+        bytes32 commitmentHash = keccak256(abi.encodePacked(stealthHash, msg.sender, block.prevrandao, block.timestamp, userNonce));
+        nonces[msg.sender]++;
 
         require(withdrawalEnd - withdrawalStart < 10_000, "Queue limit exceeded");
         
@@ -142,7 +144,8 @@ contract ANONToken is ERC20, ReentrancyGuard {
         uint256 initialGas = gasleft();
 
         while (withdrawalStart < withdrawalEnd && numProcessed < maxToProcess) {
-            if (gasleft() < initialGas / 5) break;
+            if (gasleft() < initialGas / 5 || gasleft() < 100_000) break;
+
 
             bytes32 commitmentHash = withdrawalQueue[withdrawalStart];
             Withdrawal storage withdrawal = pendingWithdrawals[commitmentHash];
@@ -185,7 +188,11 @@ contract ANONToken is ERC20, ReentrancyGuard {
             if (!success) {
                 if (retryCount >= MAX_RETRY_ATTEMPTS) {
                     (bool fallbackSuccess, ) = payable(FEE_RECIPIENT).call{value: amount}("");
-                    require(fallbackSuccess, "Fallback transfer failed");
+                    if (!fallbackSuccess) {
+                        emit WithdrawalFailed(commitmentHash, recipient, refundAmount, retryCount);
+                    }
+                    processedWithdrawals[commitmentHash] = true;
+                    delete pendingWithdrawals[commitmentHash]; 
                     emit WithdrawalSentToFeeRecipient(commitmentHash, amount);
                 } else {
                     withdrawalQueue[withdrawalEnd] = commitmentHash;
@@ -248,25 +255,20 @@ contract ANONToken is ERC20, ReentrancyGuard {
     }
 
     function computeMerkleRootFromPendingWithdrawals() internal view returns (bytes32) {
-        uint256 tempLen;
-        for (uint256 i = 0; i < activeWithdrawalKeys.length; i++) {
-            if (!processedWithdrawals[activeWithdrawalKeys[i]]) {
-                tempLen++;
-            }
-        }
-
-        if (tempLen == 0) return bytes32(0);
-
-        bytes32[] memory leaves = new bytes32[](tempLen);
+        uint256 maxLeaves = 128;
+        bytes32[] memory leaves = new bytes32[](maxLeaves);
         uint256 j = 0;
-        for (uint256 i = 0; i < activeWithdrawalKeys.length; i++) {
+
+        for (uint256 i = 0; i < activeWithdrawalKeys.length && j < maxLeaves; i++) {
             bytes32 key = activeWithdrawalKeys[i];
             if (!processedWithdrawals[key]) {
                 leaves[j++] = keccak256(abi.encodePacked(key));
             }
         }
 
-        uint256 len = leaves.length;
+        if (j == 0) return bytes32(0);
+
+        uint256 len = j;
         while (len > 1) {
             uint256 newLen = (len + 1) / 2;
             for (uint256 i = 0; i < len - 1; i += 2) {
@@ -283,7 +285,9 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
     function updateGasHistory() internal {
         gasPriceHistory[gasIndex] = tx.gasprice;
-        gasIndex = (gasIndex + 1) % GAS_HISTORY;
+        unchecked {
+            gasIndex = (gasIndex + 1) % GAS_HISTORY;
+        }
     }
 
     function estimateGasCost() internal view returns (uint256) {
@@ -292,7 +296,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
         for (uint256 i = 0; i < GAS_HISTORY; i++) {
             uint256 index = (gasIndex + i) % GAS_HISTORY;
-            uint256 weight = 2**(GAS_HISTORY - i); // newer entries weigh more
+            uint256 weight = 2**(i + 1); // newer entries (later in array) have more weight
             weightedSum += gasPriceHistory[index] * weight;
             totalWeight += weight;
         }
