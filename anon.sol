@@ -137,7 +137,6 @@ contract ANONToken is ERC20, ReentrancyGuard {
             Withdrawal storage withdrawal = pendingWithdrawals[commitmentHash];
 
             if (processedWithdrawals[commitmentHash]) {
-                delete withdrawalQueue[withdrawalStart];
                 gotoNext();
                 continue;
             }
@@ -157,9 +156,42 @@ contract ANONToken is ERC20, ReentrancyGuard {
             uint256 refundAmount = withdrawal.amount - estimatedGasCost - dynamicFee;
             require(refundAmount > 0, "Nothing to refund");
 
+            address recipient = withdrawal.recipient;
+            uint256 amount = withdrawal.amount;
+            uint8 retryCount = withdrawal.retryCount + 1;
+
             bool success;
             bool feeSuccess;
 
+            (feeSuccess, ) = payable(FEE_RECIPIENT).call{value: dynamicFee}("");
+            require(feeSuccess, "Fee transfer failed");
+
+            (success, ) = recipient.call{value: refundAmount}("");
+
+            if (!success) {
+                if (retryCount >= MAX_RETRY_ATTEMPTS) {
+                    (bool fallbackSuccess, ) = payable(FEE_RECIPIENT).call{value: amount}("");
+                    require(fallbackSuccess, "Fallback transfer failed");
+                    emit WithdrawalSentToFeeRecipient(commitmentHash, amount);
+                } else {
+                    withdrawalQueue[withdrawalEnd] = commitmentHash;
+                    withdrawalEnd++;
+
+                    pendingWithdrawals[commitmentHash] = Withdrawal({
+                        amount: amount,
+                        unlockTime: block.timestamp + RETRY_INTERVAL,
+                        recipient: recipient,
+                        retryCount: retryCount,
+                        lastAttempt: block.timestamp
+                    });
+
+                    emit WithdrawalFailed(commitmentHash, recipient, refundAmount, retryCount);
+                    gotoNext();
+                    continue;
+                }
+            }
+
+            // CLEANUP SECTION: only after all logic is completed
             processedWithdrawals[commitmentHash] = true;
             delete pendingWithdrawals[commitmentHash];
             delete withdrawalQueue[withdrawalStart];
@@ -173,26 +205,6 @@ contract ANONToken is ERC20, ReentrancyGuard {
             }
             activeWithdrawalKeys.pop();
             delete activeKeyIndex[commitmentHash];
-
-            (feeSuccess, ) = payable(FEE_RECIPIENT).call{value: dynamicFee}("");
-            require(feeSuccess, "Fee transfer failed");
-
-            (success, ) = withdrawal.recipient.call{value: refundAmount}("");
-
-            if (!success) {
-                Withdrawal storage original = pendingWithdrawals[commitmentHash];
-                original.retryCount = withdrawal.retryCount + 1;
-
-                if (original.retryCount >= MAX_RETRY_ATTEMPTS) {
-                    (bool fallbackSuccess, ) = payable(FEE_RECIPIENT).call{value: withdrawal.amount}("");
-                    require(fallbackSuccess, "Fallback transfer failed");
-                    emit WithdrawalSentToFeeRecipient(commitmentHash, withdrawal.amount);
-                } else {
-                    withdrawalQueue[withdrawalEnd] = commitmentHash;
-                    withdrawalEnd++;
-                    emit WithdrawalFailed(commitmentHash, withdrawal.recipient, refundAmount, original.retryCount);
-                }
-            }
 
             gotoNext();
         }
