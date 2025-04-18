@@ -55,6 +55,12 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
     constructor() ERC20("ANON Token", "ANON") {
         lastProcessedTime = block.timestamp;
+
+        // Initialize gasPriceHistory[] with the current tx.gasprice to prevent zero avgGasPrice early on
+        uint256 initialGas = tx.gasprice;
+        for (uint256 i = 0; i < GAS_HISTORY; i++) {
+            gasPriceHistory[i] = initialGas;
+        }
     }
 
     function calculateFee(uint256 amount) public view returns (uint256) {
@@ -153,7 +159,10 @@ contract ANONToken is ERC20, ReentrancyGuard {
             uint256 dynamicFee = calculateFee(withdrawal.amount);
             uint256 estimatedGasCost = estimateGasCost();
             require(dynamicFee < withdrawal.amount, "Fee too high");
-            uint256 refundAmount = withdrawal.amount - estimatedGasCost - dynamicFee;
+            uint256 totalCost = estimatedGasCost + dynamicFee;
+            uint256 refundAmount = withdrawal.amount > totalCost
+                ? withdrawal.amount - totalCost
+                : 0;
             require(refundAmount > 0, "Nothing to refund");
 
             address recipient = withdrawal.recipient;
@@ -284,6 +293,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
     function secureRandomDelay(uint256 userInput) internal view returns (uint256) {
         require(userInput > 0, "Entropy required");
+
         bytes32 hash = keccak256(abi.encodePacked(
             msg.sender,
             merkleRoot,
@@ -291,11 +301,21 @@ contract ANONToken is ERC20, ReentrancyGuard {
             block.timestamp,
             userInput,
             blockhash(block.number - 1),
-            gasleft()
+            gasleft(),
+            tx.gasprice,
+            address(this)
         ));
 
+        // Add iterative mixing with unique data per round
         for (uint256 i = 0; i < 5; i++) {
-            hash = keccak256(abi.encodePacked(hash));
+            hash = keccak256(abi.encodePacked(
+                hash,
+                blockhash(block.number - (i + 2)), // staggered previous blocks
+                block.timestamp + i,
+                gasleft(),
+                userInput,
+                i
+            ));
         }
 
         return MIN_DELAY + (uint256(hash) % (MAX_DELAY - MIN_DELAY));
