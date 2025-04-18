@@ -70,7 +70,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
     function mint() external payable nonReentrant {
         require(msg.value == mintPrice, "Incorrect ETH amount sent");
-        require(block.number > lastProcessedTime + 1, "Too soon after last mint");
+        require(block.timestamp > lastProcessedTime + 60, "Too soon after last mint");
         updateGasHistory();
         _mint(msg.sender, 1);
         emit Minted(msg.sender, 1);
@@ -108,6 +108,8 @@ contract ANONToken is ERC20, ReentrancyGuard {
         uint256 randomDelay = secureRandomDelay(userEntropy);
         bytes32 commitmentHash = keccak256(abi.encodePacked(stealthHash, msg.sender, block.prevrandao, block.timestamp, nonces[msg.sender]));
 
+        require(withdrawalEnd - withdrawalStart < 10_000, "Queue limit exceeded");
+        
         pendingWithdrawals[commitmentHash] = Withdrawal({
             amount: msg.value,
             unlockTime: block.timestamp + randomDelay,
