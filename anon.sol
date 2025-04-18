@@ -24,6 +24,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
     mapping(bytes32 => bool) private registeredStealthAddresses;
     mapping(bytes32 => uint256) private activeKeyIndex;
     mapping(bytes32 => bool) public usedSignatures;
+    mapping(address => uint256) public burnIds;
 
     bytes32 public merkleRoot;
     uint256 public lastProcessedTime;
@@ -64,7 +65,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         }
     }
 
-    function calculateFee(uint256 amount) public view returns (uint256) {
+    function calculateFee(uint256 amount) public pure returns (uint256) {
         return (amount * feeBasisPoints) / 10000;
     }
 
@@ -97,9 +98,9 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
         updateGasHistory();
 
-        uint256 userNonce = nonces[msg.sender];
+        uint256 burnId = burnIds[msg.sender];
 
-        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, stealthHash, address(this), userNonce, block.chainid));
+        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, stealthHash, address(this), burnId, block.chainid));
         bytes32 ethSignedMessage = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
         require(!usedSignatures[ethSignedMessage], "Signature already used");
         usedSignatures[ethSignedMessage] = true;
@@ -107,14 +108,15 @@ contract ANONToken is ERC20, ReentrancyGuard {
         require(signer != address(0), "Zero address signature");
         require(signer == msg.sender, "Invalid signature");
 
-        bytes32 commitmentHash = keccak256(abi.encodePacked(stealthHash, msg.sender, block.prevrandao, block.timestamp, userNonce));
-        nonces[msg.sender]++;
+        uint256 randomDelay = secureRandomDelay(userEntropy);
+        bytes32 commitmentHash = keccak256(abi.encodePacked(stealthHash, msg.sender, block.prevrandao, block.timestamp, burnId));
+        burnIds[msg.sender]++;
 
         require(withdrawalEnd - withdrawalStart < 10_000, "Queue limit exceeded");
-        
+
         pendingWithdrawals[commitmentHash] = Withdrawal({
             amount: msg.value,
-            unlockTime: block.timestamp + randomDelay,
+            unlockTime: block.timestamp + randomDelay, // ✅ now defined
             recipient: stealthRecipient,
             retryCount: 0,
             lastAttempt: 0
@@ -198,13 +200,10 @@ contract ANONToken is ERC20, ReentrancyGuard {
                     withdrawalQueue[withdrawalEnd] = commitmentHash;
                     withdrawalEnd++;
 
-                    pendingWithdrawals[commitmentHash] = Withdrawal({
-                        amount: amount,
-                        unlockTime: block.timestamp + RETRY_INTERVAL,
-                        recipient: recipient,
-                        retryCount: retryCount,
-                        lastAttempt: block.timestamp
-                    });
+                    // 🔁 Reuse the existing struct
+                    withdrawal.unlockTime = block.timestamp + RETRY_INTERVAL;
+                    withdrawal.retryCount = retryCount;
+                    withdrawal.lastAttempt = block.timestamp;
 
                     emit WithdrawalFailed(commitmentHash, recipient, refundAmount, retryCount);
                     gotoNext();
@@ -266,7 +265,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
             }
         }
 
-        if (j == 0) return bytes32(0);
+        if (j == 0) return merkleRoot;
 
         uint256 len = j;
         while (len > 1) {
@@ -295,7 +294,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         uint256 totalWeight = 0;
 
         for (uint256 i = 0; i < GAS_HISTORY; i++) {
-            uint256 index = (gasIndex + i) % GAS_HISTORY;
+            uint256 index = (gasIndex + GAS_HISTORY - 1 - i) % GAS_HISTORY;
             uint256 weight = 2**(i + 1); // newer entries (later in array) have more weight
             weightedSum += gasPriceHistory[index] * weight;
             totalWeight += weight;
