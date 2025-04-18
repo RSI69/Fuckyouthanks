@@ -64,7 +64,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         }
     }
 
-    function calculateFee(uint256 amount) public view returns (uint256) {
+    function calculateFee(uint256 amount) public pure returns (uint256) {
         return (amount * feeBasisPoints) / 10000;
     }
 
