@@ -285,13 +285,21 @@ contract ANONToken is ERC20, ReentrancyGuard {
     }
 
     function estimateGasCost() internal view returns (uint256) {
-        uint256 sum = 0;
+        uint256 weightedSum = 0;
+        uint256 totalWeight = 0;
+
         for (uint256 i = 0; i < GAS_HISTORY; i++) {
-            sum += gasPriceHistory[i];
+            uint256 index = (gasIndex + i) % GAS_HISTORY;
+            uint256 weight = 2**(GAS_HISTORY - i); // newer entries weigh more
+            weightedSum += gasPriceHistory[index] * weight;
+            totalWeight += weight;
         }
-        uint256 avgGasPrice = sum / GAS_HISTORY;
-        uint256 adjustedGasPrice = avgGasPrice + (avgGasPrice / 4);
-        return 300000 * (tx.gasprice > adjustedGasPrice ? tx.gasprice : adjustedGasPrice);
+
+        uint256 ewmaGasPrice = weightedSum / totalWeight;
+        uint256 paddedGasPrice = ewmaGasPrice + (ewmaGasPrice / 4); // add 25% buffer
+        uint256 usedGasPrice = tx.gasprice > paddedGasPrice ? tx.gasprice : paddedGasPrice;
+
+        return 300_000 * usedGasPrice;
     }
 
     function secureRandomDelay(uint256 userInput) internal view returns (uint256) {
