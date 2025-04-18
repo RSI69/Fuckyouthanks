@@ -23,6 +23,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
     mapping(address => uint256) private nonces;
     mapping(bytes32 => bool) private registeredStealthAddresses;
     mapping(bytes32 => uint256) private activeKeyIndex;
+    mapping(bytes32 => bool) public usedSignatures;
 
     bytes32 public merkleRoot;
     uint256 public lastProcessedTime;
@@ -97,6 +98,8 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
         bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, stealthHash, address(this), nonces[msg.sender], block.chainid));
         bytes32 ethSignedMessage = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
+        require(!usedSignatures[ethSignedMessage], "Signature already used");
+        usedSignatures[ethSignedMessage] = true;
         address signer = ECDSA.recover(ethSignedMessage, signature);
         require(signer != address(0), "Zero address signature");
         require(signer == msg.sender, "Invalid signature");
