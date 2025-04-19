@@ -221,9 +221,9 @@ contract ANONToken is ERC20, ReentrancyGuard {
                 }
                 activeWithdrawalKeys.pop();
                 delete activeKeyIndex[commitmentHash];
-
-                gotoNext();
             }
+
+            gotoNext();
 
         lastProcessedTime = block.timestamp;
 
