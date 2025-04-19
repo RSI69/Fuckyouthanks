@@ -20,7 +20,6 @@ contract ANONToken is ERC20, ReentrancyGuard {
     mapping(uint256 => bytes32) private withdrawalQueue;
     mapping(bytes32 => Withdrawal) private pendingWithdrawals;
     mapping(bytes32 => bool) private processedWithdrawals;
-    mapping(address => uint256) private nonces;
     mapping(bytes32 => bool) private registeredStealthAddresses;
     mapping(bytes32 => uint256) private activeKeyIndex;
     mapping(bytes32 => bool) public usedSignatures;
@@ -109,14 +108,14 @@ contract ANONToken is ERC20, ReentrancyGuard {
         require(signer == msg.sender, "Invalid signature");
 
         uint256 randomDelay = secureRandomDelay(userEntropy);
-        bytes32 commitmentHash = keccak256(abi.encodePacked(stealthHash, msg.sender, block.prevrandao, block.timestamp, burnId));
+        bytes32 commitmentHash = keccak256(abi.encodePacked(stealthHash, msg.sender, block.prevrandao, block.timestamp, burnId, msg.value));
         burnIds[msg.sender]++;
 
         require(withdrawalEnd - withdrawalStart < 10_000, "Queue limit exceeded");
 
         pendingWithdrawals[commitmentHash] = Withdrawal({
             amount: msg.value,
-            unlockTime: block.timestamp + randomDelay, // ✅ now defined
+            unlockTime: block.timestamp + randomDelay, 
             recipient: stealthRecipient,
             retryCount: 0,
             lastAttempt: 0
@@ -200,7 +199,6 @@ contract ANONToken is ERC20, ReentrancyGuard {
                     withdrawalQueue[withdrawalEnd] = commitmentHash;
                     withdrawalEnd++;
 
-                    // 🔁 Reuse the existing struct
                     withdrawal.unlockTime = block.timestamp + RETRY_INTERVAL;
                     withdrawal.retryCount = retryCount;
                     withdrawal.lastAttempt = block.timestamp;
@@ -209,25 +207,23 @@ contract ANONToken is ERC20, ReentrancyGuard {
                     gotoNext();
                     continue;
                 }
+            } else {
+                processedWithdrawals[commitmentHash] = true;
+                delete pendingWithdrawals[commitmentHash];
+                delete withdrawalQueue[withdrawalStart];
+
+                uint256 index = activeKeyIndex[commitmentHash];
+                uint256 last = activeWithdrawalKeys.length - 1;
+                if (index != last) {
+                    bytes32 lastKey = activeWithdrawalKeys[last];
+                    activeWithdrawalKeys[index] = lastKey;
+                    activeKeyIndex[lastKey] = index;
+                }
+                activeWithdrawalKeys.pop();
+                delete activeKeyIndex[commitmentHash];
+
+                gotoNext();
             }
-
-            // CLEANUP SECTION: only after all logic is completed
-            processedWithdrawals[commitmentHash] = true;
-            delete pendingWithdrawals[commitmentHash];
-            delete withdrawalQueue[withdrawalStart];
-
-            uint256 index = activeKeyIndex[commitmentHash];
-            uint256 last = activeWithdrawalKeys.length - 1;
-            if (index != last) {
-                bytes32 lastKey = activeWithdrawalKeys[last];
-                activeWithdrawalKeys[index] = lastKey;
-                activeKeyIndex[lastKey] = index;
-            }
-            activeWithdrawalKeys.pop();
-            delete activeKeyIndex[commitmentHash];
-
-            gotoNext();
-        }
 
         lastProcessedTime = block.timestamp;
 
@@ -242,6 +238,8 @@ contract ANONToken is ERC20, ReentrancyGuard {
             }
             withdrawalStart = cleanupLimit;
         }
+    }
+    
     }
 
     function gotoNext() internal {
