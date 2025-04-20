@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>ANONToken DApp</title>
+</head>
+<body>
+  <h1>ANONToken</h1>
+  <button id="connect">Connect Wallet</button><br><br>
+  <button id="mint">Mint 1 ANON (0.1 ETH)</button><br><br>
+  <input id="stealth" placeholder="Stealth address" size="50"/>
+  <button id="burn">Burn ANON for Stealth Withdraw</button>
+
+  <script type="module">
+    import { ethers } from 'https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.esm.min.js';
+
+    const CONTRACT_ADDRESS = "0xYourContractAddress";
+    const CONTRACT_ABI = [/* insert full ABI array here */];
+    const LINEA_CHAIN_ID = 59144;
+
+    async function ensureLinea() {
+      const provider = window.ethereum;
+      const { chainId } = await provider.request({ method: "eth_chainId" });
+      if (parseInt(chainId, 16) !== LINEA_CHAIN_ID) {
+        try {
+          await provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0xe708" }] });
+        } catch (err) {
+          if (err.code === 4902) {
+            await provider.request({
+              method: "wallet_addEthereumChain",
+              params: [{
+                chainId: "0xe708",
+                chainName: "Linea Mainnet",
+                rpcUrls: ["https://rpc.linea.build"],
+                nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+                blockExplorerUrls: ["https://lineascan.build"]
+              }]
+            });
+          } else {
+            throw err;
+          }
+        }
+      }
+    }
+
+    function generateEntropy() {
+      const array = new Uint32Array(8);
+      window.crypto.getRandomValues(array);
+      return BigInt("0x" + Array.from(array).map(x => x.toString(16).padStart(8, '0')).join(""));
+    }
+
+    function hashStealthAddress(stealthRecipient) {
+      return ethers.utils.keccak256(
+        ethers.utils.defaultAbiCoder.encode(["address"], [stealthRecipient])
+      );
+    }
+
+    async function requestAnonBurn({ provider, userAddress, stealthRecipient, merkleProof }) {
+      const signer = provider.getSigner();
+      const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+
+      const stealthHash = hashStealthAddress(stealthRecipient);
+      const isRegistered = await contract.registeredStealthAddresses(stealthHash);
+      if (!isRegistered) {
+        const tx = await contract.registerStealthAddress(stealthHash, merkleProof);
+        await tx.wait();
+      }
+
+      const burnId = await contract.burnIds(userAddress);
+      const { chainId } = await provider.getNetwork();
+
+      const messageHash = ethers.utils.solidityKeccak256(
+        ["address", "bytes32", "address", "uint256", "uint256"],
+        [userAddress, stealthHash, CONTRACT_ADDRESS, burnId, chainId]
+      );
+      const signature = await signer.signMessage(ethers.utils.arrayify(messageHash));
+
+      const estimatedGasCost = await contract.estimateGasCost();
+      const dynamicFee = await contract.calculateFee(estimatedGasCost);
+      const totalValue = estimatedGasCost.add(dynamicFee);
+
+      const entropy = generateEntropy();
+      const gasEstimate = await contract.estimateGas.requestBurn(
+        stealthHash,
+        stealthRecipient,
+        signature,
+        entropy,
+        { value: totalValue }
+      );
+
+      const tx = await contract.requestBurn(
+        stealthHash,
+        stealthRecipient,
+        signature,
+        entropy,
+        {
+          value: totalValue,
+          gasLimit: gasEstimate.add(ethers.BigNumber.from("50000"))
+        }
+      );
+
+      await tx.wait();
+      return {
+        hash: tx.hash,
+        explorer: `https://lineascan.build/tx/${tx.hash}`
+      };
+    }
+
+    window.onload = () => {
+      const connectBtn = document.getElementById("connect");
+      const mintBtn = document.getElementById("mint");
+      const burnBtn = document.getElementById("burn");
+
+      let provider;
+
+      connectBtn.onclick = async () => {
+        await ensureLinea();
+        await window.ethereum.request({ method: "eth_requestAccounts" });
+        provider = new ethers.providers.Web3Provider(window.ethereum);
+        alert("Connected to Linea");
+      };
+
+      mintBtn.onclick = async () => {
+        const signer = provider.getSigner();
+        const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+        const tx = await contract.mint({ value: ethers.utils.parseEther("0.1") });
+        await tx.wait();
+        alert("Minted 1 ANON");
+      };
+
+      burnBtn.onclick = async () => {
+        const stealth = document.getElementById("stealth").value;
+        const userAddress = await provider.getSigner().getAddress();
+        const merkleProof = []; // You must populate this properly
+        const tx = await requestAnonBurn({ provider, userAddress, stealthRecipient: stealth, merkleProof });
+        alert("Burn complete: " + tx.explorer);
+      };
+    };
+  </script>
+</body>
+</html>
