@@ -7,15 +7,129 @@
 <body>
   <h1>ANONToken</h1>
   <button id="connect">Connect Wallet</button><br><br>
-  <button id="mint">Mint 1 ANON (0.1 ETH)</button><br><br>
+  <button id="mint">Mint 1 ANON (0.00000001 ETH)</button><br><br>
   <input id="stealth" placeholder="Stealth address" size="50"/>
   <button id="burn">Burn ANON for Stealth Withdraw</button>
 
   <script type="module">
     import { ethers } from 'https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.esm.min.js';
 
-    const CONTRACT_ADDRESS = "0xYourContractAddress";
-    const CONTRACT_ABI = [/* insert full ABI array here */];
+    const CONTRACT_ADDRESS = "0x7a90474451219Dff38a45227907035189499300e";
+    const CONTRACT_ABI = [
+      {
+        "inputs": [
+          { "internalType": "address", "name": "spender", "type": "address" },
+          { "internalType": "uint256", "name": "value", "type": "uint256" }
+        ],
+        "name": "approve",
+        "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "stateMutability": "nonpayable",
+        "type": "constructor"
+      },
+      {
+        "inputs": [],
+        "name": "mint",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          { "internalType": "bytes32", "name": "stealthHash", "type": "bytes32" },
+          { "internalType": "bytes32[]", "name": "proof", "type": "bytes32[]" }
+        ],
+        "name": "registerStealthAddress",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          { "internalType": "bytes32", "name": "stealthHash", "type": "bytes32" },
+          { "internalType": "address", "name": "stealthRecipient", "type": "address" },
+          { "internalType": "bytes", "name": "signature", "type": "bytes" },
+          { "internalType": "uint256", "name": "userEntropy", "type": "uint256" }
+        ],
+        "name": "requestBurn",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "name": "mintPrice",
+        "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          { "internalType": "address", "name": "owner", "type": "address" },
+          { "internalType": "address", "name": "spender", "type": "address" }
+        ],
+        "name": "allowance",
+        "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          { "internalType": "address", "name": "account", "type": "address" }
+        ],
+        "name": "balanceOf",
+        "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "name": "totalSupply",
+        "outputs": [{ "internalType": "uint256", "name": "", "type": "uint256" }],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "name": "name",
+        "outputs": [{ "internalType": "string", "name": "", "type": "string" }],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "name": "symbol",
+        "outputs": [{ "internalType": "string", "name": "", "type": "string" }],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          { "internalType": "address", "name": "to", "type": "address" },
+          { "internalType": "uint256", "name": "value", "type": "uint256" }
+        ],
+        "name": "transfer",
+        "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          { "internalType": "address", "name": "from", "type": "address" },
+          { "internalType": "address", "name": "to", "type": "address" },
+          { "internalType": "uint256", "name": "value", "type": "uint256" }
+        ],
+        "name": "transferFrom",
+        "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      }
+    ];
+
     const LINEA_CHAIN_ID = 59144;
 
     async function ensureLinea() {
@@ -131,7 +245,7 @@
       burnBtn.onclick = async () => {
         const stealth = document.getElementById("stealth").value;
         const userAddress = await provider.getSigner().getAddress();
-        const merkleProof = []; // You must populate this properly
+        const merkleProof = []; // TODO: supply the proof if needed
         const tx = await requestAnonBurn({ provider, userAddress, stealthRecipient: stealth, merkleProof });
         alert("Burn complete: " + tx.explorer);
       };
