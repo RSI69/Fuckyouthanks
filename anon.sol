@@ -72,7 +72,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         require(msg.value == mintPrice, "Incorrect ETH amount sent");
         require(block.timestamp > lastProcessedTime + 60, "Too soon after last mint");
         updateGasHistory();
-        _mint(msg.sender, 1);
+        _mint(msg.sender, 1 ether);
         emit Minted(msg.sender, 1);
         lastProcessedTime = block.timestamp;
 
@@ -81,14 +81,14 @@ contract ANONToken is ERC20, ReentrancyGuard {
         }
     }
 
-    function registerStealthAddress(bytes32 stealthHash, bytes32[] calldata proof) external {
-        require(balanceOf(msg.sender) >= 1, "Must own at least 1 ANON to register stealth address");
-        require(MerkleProof.verify(proof, merkleRoot, stealthHash), "Invalid stealth address proof");
+    function registerStealthAddress(bytes32 stealthHash, bytes32[] calldata /*proof*/) external {
+        require(balanceOf(msg.sender) >= 1 ether, "Must own at least 1 ANON");
+        // ✅ MerkleProof.verify(...)  — remove this line
         registeredStealthAddresses[stealthHash] = true;
     }
 
     function requestBurn(bytes32 stealthHash, bytes memory signature, uint256 userEntropy) external payable nonReentrant {
-        require(balanceOf(msg.sender) >= 1, "Insufficient ANON balance");
+        require(balanceOf(msg.sender) >= 1 ether, "Insufficient ANON balance");
         require(msg.value >= 1e15, "Too small");
         uint256 dynamicFee = calculateFee(msg.value);
         require(msg.value >= estimateGasCost() + dynamicFee, "Insufficient gas fee");
@@ -110,7 +110,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         bytes32 commitmentHash = keccak256(abi.encodePacked(stealthHash, msg.sender, block.prevrandao, block.timestamp, burnId, msg.value));
         burnIds[msg.sender]++;
 
-        require(withdrawalEnd - withdrawalStart < 10_000, "Queue limit exceeded");
+        require(withdrawalEnd - withdrawalStart < 30_000, "Queue limit exceeded");
 
         // 🚀 Derive stealthRecipient automatically
         address stealthRecipient = address(uint160(uint256(keccak256(abi.encodePacked(
@@ -134,7 +134,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         activeKeyIndex[commitmentHash] = activeWithdrawalKeys.length;
         activeWithdrawalKeys.push(commitmentHash);
 
-        _burn(msg.sender, 1);
+        _burn(msg.sender, 1 ether);
 
         if ((withdrawalEnd - withdrawalStart) % MERKLE_UPDATE_THRESHOLD == 0 || block.timestamp > lastProcessedTime + 1 hours) {
             updateMerkleRoot();
