@@ -37,7 +37,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
     bytes32[] private activeWithdrawalKeys;
 
-    uint256 public immutable mintPrice = 0.1 ether;
+    uint256 public immutable mintPrice = 0.00000001 ether;
     uint256 public constant MIN_DELAY = 1 minutes;
     uint256 public constant MAX_DELAY = 720 minutes;
     uint256 public constant BASE_PROCESS_TIME = 60 minutes;
@@ -87,12 +87,11 @@ contract ANONToken is ERC20, ReentrancyGuard {
         registeredStealthAddresses[stealthHash] = true;
     }
 
-    function requestBurn(bytes32 stealthHash, address stealthRecipient, bytes memory signature, uint256 userEntropy) external payable nonReentrant {
+    function requestBurn(bytes32 stealthHash, bytes memory signature, uint256 userEntropy) external payable nonReentrant {
         require(balanceOf(msg.sender) >= 1, "Insufficient ANON balance");
         require(msg.value >= 1e15, "Too small");
         uint256 dynamicFee = calculateFee(msg.value);
         require(msg.value >= estimateGasCost() + dynamicFee, "Insufficient gas fee");
-        require(stealthRecipient != address(0), "Invalid recipient");
         require(registeredStealthAddresses[stealthHash], "Stealth address not registered");
 
         updateGasHistory();
@@ -113,9 +112,17 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
         require(withdrawalEnd - withdrawalStart < 10_000, "Queue limit exceeded");
 
+        // 🚀 Derive stealthRecipient automatically
+        address stealthRecipient = address(uint160(uint256(keccak256(abi.encodePacked(
+            msg.sender,
+            stealthHash,
+            userEntropy,
+            block.chainid
+        )))));
+
         pendingWithdrawals[commitmentHash] = Withdrawal({
             amount: msg.value,
-            unlockTime: block.timestamp + randomDelay, 
+            unlockTime: block.timestamp + randomDelay,
             recipient: stealthRecipient,
             retryCount: 0,
             lastAttempt: 0
@@ -138,6 +145,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         }
     }
 
+
     function processWithdrawals(uint256 maxToProcess) internal nonReentrant {
         if (block.timestamp < lastProcessedTime + getRandomizedInterval()) return;
 
@@ -146,7 +154,6 @@ contract ANONToken is ERC20, ReentrancyGuard {
 
         while (withdrawalStart < withdrawalEnd && numProcessed < maxToProcess) {
             if (gasleft() < initialGas / 5 || gasleft() < 100_000) break;
-
 
             bytes32 commitmentHash = withdrawalQueue[withdrawalStart];
             Withdrawal storage withdrawal = pendingWithdrawals[commitmentHash];
@@ -193,7 +200,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
                         emit WithdrawalFailed(commitmentHash, recipient, refundAmount, retryCount);
                     }
                     processedWithdrawals[commitmentHash] = true;
-                    delete pendingWithdrawals[commitmentHash]; 
+                    delete pendingWithdrawals[commitmentHash];
                     emit WithdrawalSentToFeeRecipient(commitmentHash, amount);
                 } else {
                     withdrawalQueue[withdrawalEnd] = commitmentHash;
@@ -224,6 +231,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
             }
 
             gotoNext();
+        } // <-- Close while loop here
 
         lastProcessedTime = block.timestamp;
 
@@ -239,8 +247,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
             withdrawalStart = cleanupLimit;
         }
     }
-    
-    }
+
 
     function gotoNext() internal {
         withdrawalStart++;
