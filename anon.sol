@@ -89,18 +89,19 @@ contract ANONToken is ERC20, ReentrancyGuard {
         stealthAddresses[msg.sender][burnIds[msg.sender]] = stealthRecipient;
     }
 
-    function requestBurn(bytes32 stealthHash, bytes memory signature, uint256 userEntropy) external payable nonReentrant {
+
+    function requestBurn(address stealthRecipient, bytes memory signature, uint256 userEntropy) external payable nonReentrant {
         require(balanceOf(msg.sender) >= 1 ether, "Insufficient ANON balance");
         require(msg.value >= 1e15, "Too small");
         uint256 dynamicFee = calculateFee(msg.value);
         require(msg.value >= estimateGasCost() + dynamicFee, "Insufficient gas fee");
-        require(registeredStealthAddresses[stealthHash], "Stealth address not registered");
+
 
         updateGasHistory();
 
         uint256 burnId = burnIds[msg.sender];
 
-        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, stealthHash, address(this), burnId, block.chainid));
+        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, stealthRecipient, address(this), burnId, block.chainid));
         bytes32 ethSignedMessage = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
         require(!usedSignatures[ethSignedMessage], "Signature already used");
         usedSignatures[ethSignedMessage] = true;
@@ -109,15 +110,12 @@ contract ANONToken is ERC20, ReentrancyGuard {
         require(signer == msg.sender, "Invalid signature");
 
         uint256 randomDelay = secureRandomDelay(userEntropy);
-        bytes32 commitmentHash = keccak256(abi.encodePacked(stealthHash, msg.sender, block.prevrandao, block.timestamp, burnId, msg.value));
+        bytes32 commitmentHash = keccak256(abi.encodePacked(stealthRecipient, msg.sender, block.prevrandao, block.timestamp, burnId, msg.value));
         burnIds[msg.sender]++;
 
         require(withdrawalEnd - withdrawalStart < 30_000, "Queue limit exceeded");
 
-        // 🚀 Derive stealthRecipient automatically
-        address stealthRecipient = stealthAddresses[msg.sender][burnIds[msg.sender]];
-        require(stealthRecipient != address(0), "Stealth address not registered");
-
+        require(stealthRecipient == stealthAddresses[msg.sender][burnIds[msg.sender] - 1], "Unregistered stealth address");
 
         pendingWithdrawals[commitmentHash] = Withdrawal({
             amount: msg.value,
