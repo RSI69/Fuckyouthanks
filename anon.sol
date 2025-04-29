@@ -17,6 +17,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
         uint256 lastAttempt;
     }
 
+    mapping(address => mapping(uint256 => address)) public stealthAddresses;
     mapping(uint256 => bytes32) private withdrawalQueue;
     mapping(bytes32 => Withdrawal) private pendingWithdrawals;
     mapping(bytes32 => bool) private processedWithdrawals;
@@ -81,10 +82,11 @@ contract ANONToken is ERC20, ReentrancyGuard {
         }
     }
 
-    function registerStealthAddress(bytes32 stealthHash, bytes32[] calldata /*proof*/) external {
+    function registerStealthAddress(address stealthRecipient) external {
         require(balanceOf(msg.sender) >= 1 ether, "Must own at least 1 ANON");
-        // ✅ MerkleProof.verify(...)  — remove this line
-        registeredStealthAddresses[stealthHash] = true;
+        require(stealthAddresses[msg.sender][burnIds[msg.sender]] == address(0), "Already registered");
+        require(stealthRecipient != address(0), "Invalid address");
+        stealthAddresses[msg.sender][burnIds[msg.sender]] = stealthRecipient;
     }
 
     function requestBurn(bytes32 stealthHash, bytes memory signature, uint256 userEntropy) external payable nonReentrant {
@@ -113,12 +115,9 @@ contract ANONToken is ERC20, ReentrancyGuard {
         require(withdrawalEnd - withdrawalStart < 30_000, "Queue limit exceeded");
 
         // 🚀 Derive stealthRecipient automatically
-        address stealthRecipient = address(uint160(uint256(keccak256(abi.encodePacked(
-            msg.sender,
-            stealthHash,
-            userEntropy,
-            block.chainid
-        )))));
+        address stealthRecipient = stealthAddresses[msg.sender][burnIds[msg.sender]];
+        require(stealthRecipient != address(0), "Stealth address not registered");
+
 
         pendingWithdrawals[commitmentHash] = Withdrawal({
             amount: msg.value,
