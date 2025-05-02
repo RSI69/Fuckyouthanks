@@ -17,7 +17,6 @@ contract ANONToken is ERC20, ReentrancyGuard {
         uint256 lastAttempt;
     }
 
-    mapping(address => bytes32) public userCommitment;
     mapping(address => uint256) public userLastMint;
     mapping(uint256 => uint256) private gasPoolForBatch;
     mapping(uint256 => bytes32) private withdrawalQueue;
@@ -37,7 +36,6 @@ contract ANONToken is ERC20, ReentrancyGuard {
     uint256 private constant GAS_HISTORY = 5;
     uint256[GAS_HISTORY] private gasPriceHistory;
     uint256 private gasIndex = 0;
-    uint256 public commitCount;
 
     bytes32[] private activeWithdrawalKeys;
 
@@ -57,7 +55,6 @@ contract ANONToken is ERC20, ReentrancyGuard {
     event MerkleRootUpdated(bytes32 newRoot);
     event WithdrawalFailed(bytes32 commitmentHash, address recipient, uint256 refundAmount, uint8 retryCount);
     event WithdrawalSentToFeeRecipient(bytes32 commitmentHash, uint256 amount);
-    event CommitReceived(address indexed who, bytes32 commitmentHash);
 
     constructor() ERC20("ANON Token", "ANON") {
         lastProcessedTime = block.timestamp;
@@ -81,103 +78,82 @@ contract ANONToken is ERC20, ReentrancyGuard {
         lastProcessedTime = block.timestamp;        
     }
 
-    function commitBurn(bytes32 commitmentHash) external nonReentrant {
-        require(balanceOf(msg.sender) >= 1 ether,"Insufficient ANON balance");
-        require(userCommitment[msg.sender] == bytes32(0),"Already committed");
-        userCommitment[msg.sender] = commitmentHash;
-        commitCount += 1;
-        emit CommitReceived(msg.sender, commitmentHash);
-    }
+    function requestBurn(address stealthRecipient, bytes memory signature, uint256 userEntropy) external payable nonReentrant {
+        require(balanceOf(msg.sender) >= 1 ether, "Insufficient ANON balance");
+        require(msg.value >= 1e15, "Must send enough ETH to cover gas and fee.");
+        uint256 fixedGas = 450_000;
+        uint256 ewma = estimateGasCost() / 300_000; // reuse your weighted gas price logic
+        uint256 fixedGasCost = fixedGas * ewma;
+        uint256 fee = calculateFee(msg.value);
+        require(msg.value >= fixedGasCost + fee, "Insufficient value");
+        require(userEntropy != 0, "Entropy required");
 
-    function revealBatch(
-        address[] calldata stealthRecipients,
-        uint256[] calldata userEntropies,
-        bytes[] calldata signatures
-    ) external payable nonReentrant {
-        require(
-        stealthRecipients.length == MIN_ANONYMITY_SET &&
-        userEntropies.length    == MIN_ANONYMITY_SET &&
-        signatures.length      == MIN_ANONYMITY_SET,
-        "Wrong batch size"
-        );
+        // Extra defense: ensure net contribution covers gas estimate
+        uint256 contribution = msg.value - fee;
+        require(contribution >= estimateGasCost(), "Did not fund gas pool");
 
-        // 1) Build an on‐chain shuffle of [0..MIN_ANONYMITY_SET)
-        uint16[] memory idx = new uint16[](MIN_ANONYMITY_SET);
-        for (uint16 i = 0; i < MIN_ANONYMITY_SET; i++) {
-        idx[i] = i;
-        }
-        // Fisher–Yates shuffle, seeded from block.prevrandao
-        for (uint16 i = uint16(MIN_ANONYMITY_SET - 1); i > 0; i--) {
-        uint256 j = uint256(keccak256(abi.encodePacked(block.prevrandao, i))) % (i + 1);
-        (idx[i], idx[j]) = (idx[j], idx[i]);
-        }
-
-        // 2) Verify _all_ 50 commitments, consume them,
-        //    then enqueue their withdrawals in shuffled order:
-        for (uint16 k = 0; k < MIN_ANONYMITY_SET; k++) {
-        uint16 i = idx[k];
-
-        // a) recompute each user’s bodyHash
-        bytes32 bodyHash = keccak256(abi.encodePacked(
-            stealthRecipients[i],
-            userEntropies[i],
+        updateGasHistory();
+        
+        uint256 burnId = burnIds[msg.sender]; // use msg.sender *temporarily* to form messageHash
+        bytes32 messageHash = keccak256(abi.encodePacked(
+            stealthRecipient,
+            burnId,
             address(this),
             block.chainid,
-            msg.value / MIN_ANONYMITY_SET
+            msg.value,
+            userEntropy
         ));
 
-        // b) recover the burner
-        bytes32 ethMsg = keccak256(
-            abi.encodePacked("\x19Ethereum Signed Message:\n32", bodyHash)
-        );
-        address burner = ECDSA.recover(ethMsg, signatures[i]);
-        require(burner != address(0), "Bad sig");
+        bytes32 signedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
 
-        // c) check & clear their commitment
-        require(userCommitment[burner] == bodyHash, "Commit mismatch");
-        delete userCommitment[burner];
-        commitCount--;
+        address signer = ECDSA.recover(signedHash, signature);
+        require(signer != address(0), "Zero address signature");
+        burnId = burnIds[signer]; // reassign with validated signer
 
-        // d) one‐time signature use
-        require(!usedSignatures[ethMsg], "Replay");
-        usedSignatures[ethMsg] = true;
+        bytes32 commitmentHash = keccak256(abi.encodePacked(stealthRecipient, burnId, block.prevrandao, block.timestamp, msg.value, userEntropy, block.chainid));
 
-        // e) now queue the actual withdrawal exactly as before
-        bytes32 queueKey = keccak256(abi.encodePacked(
-            stealthRecipients[i],
-            burnIds[burner],
-            block.prevrandao,
-            block.timestamp,
-            msg.value / MIN_ANONYMITY_SET,
-            userEntropies[i],
-            block.chainid
-        ));
-        uint256 delay = secureRandomDelay(userEntropies[i]);
+        require(!usedSignatures[signedHash], "Signature already used");
+        usedSignatures[signedHash] = true;
 
-        pendingWithdrawals[queueKey] = Withdrawal({
-            amount:     msg.value / MIN_ANONYMITY_SET,
-            unlockTime: block.timestamp + delay,
-            recipient:  stealthRecipients[i],
+        uint256 randomDelay = secureRandomDelay(userEntropy);
+
+        require(withdrawalEnd - withdrawalStart < 30_000, "Queue limit exceeded");
+
+        require(msg.sender == tx.origin, "Contracts not allowed");
+
+        pendingWithdrawals[commitmentHash] = Withdrawal({
+            amount: msg.value,
+            unlockTime: block.timestamp + randomDelay,
+            recipient: stealthRecipient,
             retryCount: 0,
-            lastAttempt:0
+            lastAttempt: 0
         });
-        withdrawalQueue[withdrawalEnd++] = queueKey;
-        batchCaller[(withdrawalEnd-1)/MIN_ANONYMITY_SET] = msg.sender;
-        gasPoolForBatch[(withdrawalEnd-1)/MIN_ANONYMITY_SET] += msg.value / MIN_ANONYMITY_SET;
-        activeKeyIndex[queueKey] = activeWithdrawalKeys.length;
-        activeWithdrawalKeys.push(queueKey);
 
-        // f) burn their token
-        _burn(burner, 1 ether);
-        burnIds[burner]++;
+        withdrawalQueue[withdrawalEnd] = commitmentHash;
+        withdrawalEnd++;
+        uint256 batchId = (withdrawalEnd - 1) / MIN_ANONYMITY_SET;
+        gasPoolForBatch[batchId] += msg.value;
+        activeKeyIndex[commitmentHash] = activeWithdrawalKeys.length;
+        activeWithdrawalKeys.push(commitmentHash);
+
+        burnIds[signer]++;
+        _burn(signer, 1 ether);
+
+
+        if ((withdrawalEnd - withdrawalStart + 1) % MIN_ANONYMITY_SET == 0) {
+            if (batchCaller[batchId] == address(0)) {
+                batchCaller[batchId] = msg.sender;
+            }
         }
 
-        // 3) once all 50 are enqueued in random order, 
-        //    call processWithdrawals() exactly as before:
-        processWithdrawals();
+        if ((withdrawalEnd - withdrawalStart) % MERKLE_UPDATE_THRESHOLD == 0 || block.timestamp > lastProcessedTime + 1 hours) {
+            updateMerkleRoot();
+        }
+
+        if ((withdrawalEnd - withdrawalStart) >= MIN_ANONYMITY_SET) {
+            processWithdrawals();
+        }
     }
-
-
 
     function processWithdrawals() public nonReentrant {
         require((withdrawalEnd - withdrawalStart) == MIN_ANONYMITY_SET, "Must process exactly 50");
