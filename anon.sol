@@ -46,7 +46,7 @@ contract ANONToken is ERC20, ReentrancyGuard {
     uint256 public constant RETRY_INTERVAL = 24 hours;
     uint8 public constant MAX_RETRY_ATTEMPTS = 7;
 
-    uint256 public immutable feeBasisPoints = 0; // 0.3%
+    uint256 public immutable feeBasisPoints = 0; // 0.0%
     address constant FEE_RECIPIENT = 0x0000000000000000000000000000000000000000;
 
     uint256 public constant MIN_ANONYMITY_SET = 50;
