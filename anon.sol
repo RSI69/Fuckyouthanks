@@ -4,7 +4,7 @@ pragma solidity ^0.8.19;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+
 
 contract ANONToken is ERC20, ReentrancyGuard {
     using ECDSA for bytes32;
@@ -17,25 +17,25 @@ contract ANONToken is ERC20, ReentrancyGuard {
         uint256 lastAttempt;
     }
 
+    mapping(address => mapping(uint256 => bool)) private usedEntropy;
+    mapping(bytes32 => bool) private queued;    
     mapping(address => uint256) public userLastMint;
     mapping(uint256 => uint256) private gasPoolForBatch;
     mapping(uint256 => bytes32) private withdrawalQueue;
     mapping(bytes32 => Withdrawal) private pendingWithdrawals;
     mapping(bytes32 => bool) private processedWithdrawals;
-    mapping(bytes32 => uint256) private activeKeyIndex;
     mapping(bytes32 => bool) public usedSignatures;
     mapping(address => uint256) public burnIds;
     mapping(uint256 => address) public batchCaller;
 
-    bytes32 public merkleRoot;
     uint256 public lastProcessedTime;
     uint256 private totalProcessedWithdrawals;
     uint256 private withdrawalStart;
     uint256 private withdrawalEnd;
-    uint256 private constant MERKLE_UPDATE_THRESHOLD = 20;
     uint256 private constant GAS_HISTORY = 5;
     uint256[GAS_HISTORY] private gasPriceHistory;
     uint256 private gasIndex = 0;
+    uint256 private constant DEFAULT_TIP = 100 wei; 
 
     bytes32[] private activeWithdrawalKeys;
 
@@ -52,16 +52,17 @@ contract ANONToken is ERC20, ReentrancyGuard {
     uint256 public constant MIN_ANONYMITY_SET = 50;
 
     event Minted(address indexed user, uint256 amount);
-    event MerkleRootUpdated(bytes32 newRoot);
+
     event WithdrawalFailed(bytes32 commitmentHash, address recipient, uint256 refundAmount, uint8 retryCount);
     event WithdrawalSentToFeeRecipient(bytes32 commitmentHash, uint256 amount);
 
     constructor() ERC20("ANON Token", "ANON") {
         lastProcessedTime = block.timestamp;
-        // Initialize gasPriceHistory[] with the current tx.gasprice to prevent zero avgGasPrice early on
-        uint256 initialGas = tx.gasprice;
+        uint256 seed = (block.basefee == 0)          
+            ? tx.gasprice
+            : block.basefee + DEFAULT_TIP;          
         for (uint256 i = 0; i < GAS_HISTORY; i++) {
-            gasPriceHistory[i] = initialGas;
+            gasPriceHistory[i] = seed;
         }
     }
 
@@ -74,278 +75,202 @@ contract ANONToken is ERC20, ReentrancyGuard {
         require(block.timestamp > userLastMint[msg.sender] + 10, "Too soon after last mint");
         userLastMint[msg.sender] = block.timestamp;
         _mint(msg.sender, 1 ether);
-        emit Minted(msg.sender, 1);
+        emit Minted(msg.sender, 1 ether);
         lastProcessedTime = block.timestamp;        
     }
 
     function requestBurn(address stealthRecipient, bytes memory signature, uint256 userEntropy) external payable nonReentrant {
         require(balanceOf(msg.sender) >= 1 ether, "Insufficient ANON balance");
         require(msg.value >= 1e15, "Must send enough ETH to cover gas and fee.");
-        uint256 fixedGas = 450_000;
-        uint256 ewma = estimateGasCost() / 300_000; // reuse your weighted gas price logic
-        uint256 fixedGasCost = fixedGas * ewma;
-        uint256 fee = calculateFee(msg.value);
-        require(msg.value >= fixedGasCost + fee, "Insufficient value");
+        updateGasHistory();   
+        uint256 requiredGas = estimateGasCost();           
+        uint256 deliverable = msg.value - requiredGas;
+        uint256 fee = calculateFee(deliverable);
+        uint256 netValue = deliverable - fee;
+        require(msg.value >= requiredGas + fee, "Insufficient value");
         require(userEntropy != 0, "Entropy required");
-
-        // Extra defense: ensure net contribution covers gas estimate
-        uint256 contribution = msg.value - fee;
-        require(contribution >= estimateGasCost(), "Did not fund gas pool");
-
-        updateGasHistory();
+        (bool feeSent, ) = payable(FEE_RECIPIENT).call{value: fee}("");
+        require(feeSent, "Fee transfer failed");
+    
+        require(netValue >= estimateGasCost(), "Did not fund gas pool");
         
-        uint256 burnId = burnIds[msg.sender]; // use msg.sender *temporarily* to form messageHash
-        bytes32 messageHash = keccak256(abi.encodePacked(
-            stealthRecipient,
-            burnId,
-            address(this),
-            block.chainid,
-            msg.value,
-            userEntropy
-        ));
+        uint256 burnId = burnIds[msg.sender];         // id belongs to the caller
 
-        bytes32 signedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
+        bytes32 signedHash = keccak256(
+            abi.encodePacked(
+                "\x19Ethereum Signed Message:\n32",
+                _msgHash(stealthRecipient, burnId, msg.sender, msg.value, userEntropy)
+            )
+        );
 
         address signer = ECDSA.recover(signedHash, signature);
-        require(signer != address(0), "Zero address signature");
-        burnId = burnIds[signer]; // reassign with validated signer
+        require(signer == msg.sender, "Signature/owner mismatch");  // prevents front‑running
 
-        bytes32 commitmentHash = keccak256(abi.encodePacked(stealthRecipient, burnId, block.prevrandao, block.timestamp, msg.value, userEntropy, block.chainid));
+        bytes32 commitmentHash =
+            _commitHash(stealthRecipient, burnId, netValue, userEntropy);
 
         require(!usedSignatures[signedHash], "Signature already used");
+        require(!usedEntropy[msg.sender][userEntropy], "Entropy reused");
+        usedEntropy[msg.sender][userEntropy] = true;
         usedSignatures[signedHash] = true;
 
-        uint256 randomDelay = secureRandomDelay(userEntropy);
+        uint256 randomDelay = secureRandomDelay(commitmentHash);
 
         require(withdrawalEnd - withdrawalStart < 30_000, "Queue limit exceeded");
 
-        require(msg.sender == tx.origin, "Contracts not allowed");
+        // require(msg.sender == tx.origin, "Contracts not allowed");
 
-        pendingWithdrawals[commitmentHash] = Withdrawal({
-            amount: msg.value,
+        pendingWithdrawals[commitmentHash] = Withdrawal({ 
+            amount: netValue,
             unlockTime: block.timestamp + randomDelay,
             recipient: stealthRecipient,
             retryCount: 0,
             lastAttempt: 0
         });
 
+        require(!queued[commitmentHash], "Commitment already queued"); // O(1) dedup
+        queued[commitmentHash] = true;
+
         withdrawalQueue[withdrawalEnd] = commitmentHash;
         withdrawalEnd++;
         uint256 batchId = (withdrawalEnd - 1) / MIN_ANONYMITY_SET;
-        gasPoolForBatch[batchId] += msg.value;
-        activeKeyIndex[commitmentHash] = activeWithdrawalKeys.length;
+        gasPoolForBatch[batchId] += netValue;
         activeWithdrawalKeys.push(commitmentHash);
 
         burnIds[signer]++;
         _burn(signer, 1 ether);
 
-
-        if ((withdrawalEnd - withdrawalStart + 1) % MIN_ANONYMITY_SET == 0) {
+        if ((withdrawalEnd - withdrawalStart) % MIN_ANONYMITY_SET == 0) {
             if (batchCaller[batchId] == address(0)) {
                 batchCaller[batchId] = msg.sender;
             }
         }
 
-        if ((withdrawalEnd - withdrawalStart) % MERKLE_UPDATE_THRESHOLD == 0 || block.timestamp > lastProcessedTime + 1 hours) {
-            updateMerkleRoot();
-        }
 
         if ((withdrawalEnd - withdrawalStart) >= MIN_ANONYMITY_SET) {
-            processWithdrawals();
+            _processWithdrawalsInternal();
+
         }
     }
 
-    function processWithdrawals() public nonReentrant {
+    function _processWithdrawalsInternal() private {
         require((withdrawalEnd - withdrawalStart) == MIN_ANONYMITY_SET, "Must process exactly 50");
         require(msg.sender == tx.origin, "No contracts");
+
         uint256 batchId = withdrawalStart / MIN_ANONYMITY_SET;
         require(msg.sender == batchCaller[batchId], "Only last burner can process this batch");
-        delete batchCaller[batchId]; // cleanup
+        delete batchCaller[batchId];                       // cleanup
         require(burnIds[msg.sender] > 0, "Must be recent burner");
 
         uint256 gasStart = gasleft();
-        uint256 batchStart = withdrawalStart;
-        uint256 batchEnd = batchStart + MIN_ANONYMITY_SET;
 
-        uint256 availablePool = gasPoolForBatch[batchId]; // cache before deleting
-        delete gasPoolForBatch[batchId];                  // delete after caching
+        /* ---------- gas pool ---------- */
+        uint256 availablePool = gasPoolForBatch[batchId]; 
 
-        uint256 dynamicFeePerUser = calculateFee(availablePool / MIN_ANONYMITY_SET);
-        uint256 estimatedGas = estimateGasCost();
-        uint256 estimatedTotal = estimatedGas + dynamicFeePerUser;
-        uint256 totalSpent = estimatedTotal * MIN_ANONYMITY_SET;
-        uint256 callerReimbursement = 0;
+        require(
+            availablePool >= estimateGasCost() * MIN_ANONYMITY_SET,
+            "Gas pool under funded"
+        );
 
-        // use cached availablePool here too
-        uint256 remainder = availablePool > totalSpent ? availablePool - totalSpent : 0;
+        /* ---------- shuffle commitments ---------- */
+        bytes32[] memory shuffled   = new bytes32[](MIN_ANONYMITY_SET);
+        address[] memory recipients = new address[](MIN_ANONYMITY_SET);
 
-        // --- Shuffle commitment hashes ---
-        bytes32[] memory shuffled = new bytes32[](MIN_ANONYMITY_SET);
+        uint256 completedCount = 0;
+
         for (uint256 i = 0; i < MIN_ANONYMITY_SET; i++) {
-            shuffled[i] = withdrawalQueue[batchStart + i];
+            bytes32 h = withdrawalQueue[withdrawalStart + i];
+            shuffled[i]   = h;
+            recipients[i] = pendingWithdrawals[h].recipient;
         }
-
         for (uint256 i = MIN_ANONYMITY_SET - 1; i > 0; i--) {
             uint256 j = uint256(keccak256(abi.encodePacked(block.prevrandao, i))) % (i + 1);
-            (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
+            (shuffled[i], shuffled[j])     = (shuffled[j], shuffled[i]);
+            (recipients[i], recipients[j]) = (recipients[j], recipients[i]);
         }
 
-        // --- Process withdrawals ---
-        // Update refundPerUser after caller reimbursement
-        uint256 leftoverPool = 0;
-        uint256 refundPerUser = 0;
-
-        if (remainder > callerReimbursement) {
-            leftoverPool = remainder - callerReimbursement;
-            refundPerUser = leftoverPool / MIN_ANONYMITY_SET;
-        }
-
-        // --- Process withdrawals ---
+        /* ---------- main withdrawal loop ---------- */
         for (uint256 i = 0; i < MIN_ANONYMITY_SET; i++) {
             bytes32 commitmentHash = shuffled[i];
-            Withdrawal storage withdrawal = pendingWithdrawals[commitmentHash];
+            Withdrawal storage w   = pendingWithdrawals[commitmentHash];
 
-            if (processedWithdrawals[commitmentHash]) {
-                continue;
-            }
+            if (
+                processedWithdrawals[commitmentHash] ||
+                block.timestamp < w.unlockTime ||
+                block.timestamp < w.lastAttempt + RETRY_INTERVAL
+            ) { continue; }
 
-            if (block.timestamp < withdrawal.unlockTime || block.timestamp < withdrawal.lastAttempt + RETRY_INTERVAL) {
-                continue;
-            }
+            w.lastAttempt = block.timestamp;
 
-            withdrawal.lastAttempt = block.timestamp;
-            uint8 retryCount = withdrawal.retryCount + 1;
-            address recipient = withdrawal.recipient;
-            uint256 refund = withdrawal.amount - dynamicFeePerUser + refundPerUser;
+                        /* EFFECTS */
+            address recipient = w.recipient;
+            uint256 amountWei = w.amount;
 
-            bool sent = false;
+            /* INTERACTION */
+            (bool ok, ) = payable(recipient).call{value: amountWei}("");
 
-            (sent, ) = recipient.call{value: refund}("");
-
-            if (!sent) {
-                if (retryCount >= MAX_RETRY_ATTEMPTS) {
-                    (bool sentToFee, ) = payable(FEE_RECIPIENT).call{value: withdrawal.amount}("");
-                    emit WithdrawalSentToFeeRecipient(commitmentHash, withdrawal.amount);
-                    if (!sentToFee) {
-                        emit WithdrawalFailed(commitmentHash, recipient, refund, retryCount);
-                    }
-                    processedWithdrawals[commitmentHash] = true;
-                    delete pendingWithdrawals[commitmentHash];
-                } else {
-                    withdrawal.retryCount = retryCount;
-                    withdrawal.unlockTime = block.timestamp + RETRY_INTERVAL;
-                    emit WithdrawalFailed(commitmentHash, recipient, refund, retryCount);
-                    continue;
-                }
-            } else {
+            if (ok) {
+                /* SUCCESS: mark processed and clean up */
                 processedWithdrawals[commitmentHash] = true;
                 delete pendingWithdrawals[commitmentHash];
-            }
+                queued[commitmentHash] = false;
+                completedCount += 1;
+            } else {
+                /* FAILURE: increment retry counter */
+                w.retryCount += 1;
 
-            // Deduplicate commitmentHash in queue
-            for (uint256 j = withdrawalStart; j < withdrawalEnd; j++) {
-                if (withdrawalQueue[j] == commitmentHash && j != withdrawalStart) {
-                    delete withdrawalQueue[j];
+                if (w.retryCount >= MAX_RETRY_ATTEMPTS) {
+                    // Give up → send to fee recipient, mark processed
+                    (bool feeOk, ) = payable(FEE_RECIPIENT).call{value: amountWei}("");
+                    require(feeOk, "FeeRecipient transfer failed");
+
+                    processedWithdrawals[commitmentHash] = true;
+                    delete pendingWithdrawals[commitmentHash];
+                    queued[commitmentHash] = false;
+                    completedCount += 1;
+                    emit WithdrawalFailed(
+                        commitmentHash,
+                        recipient,
+                        amountWei,
+                        w.retryCount
+                    );
                 }
             }
 
-            // Cleanup
-            uint256 index = activeKeyIndex[commitmentHash];
-            uint256 last = activeWithdrawalKeys.length - 1;
-            if (index != last) {
-                bytes32 lastKey = activeWithdrawalKeys[last];
-                activeWithdrawalKeys[index] = lastKey;
-                activeKeyIndex[lastKey] = index;
-            }
-            activeWithdrawalKeys.pop();
-            delete activeKeyIndex[commitmentHash];
         }
 
-        // Clear queue
-        for (uint256 i = batchStart; i < batchEnd; i++) {
-            delete withdrawalQueue[i];
-        }
-
-        withdrawalStart = batchEnd;
-        totalProcessedWithdrawals += MIN_ANONYMITY_SET;
-        lastProcessedTime = block.timestamp;
-
-        if (totalProcessedWithdrawals % MERKLE_UPDATE_THRESHOLD == 0) {
-            updateMerkleRoot();
-        }
-
+        /* ---------- reimburse caller ---------- */
         uint256 gasUsed = gasStart - gasleft();
-        uint256 actualUsed = gasUsed * tx.gasprice;
-        uint256 maxReimbursable = availablePool / MIN_ANONYMITY_SET; // conservative per-user cap
-        callerReimbursement = actualUsed > maxReimbursable ? maxReimbursable : actualUsed;
-        (bool reimbursed, ) = payable(msg.sender).call{value: callerReimbursement}("");
-        require(reimbursed, "Gas reimbursement failed");
+        uint256 effectivePrice = block.basefee + DEFAULT_TIP;
+        uint256 weiUsed = gasUsed * effectivePrice;
+        uint256 cap = availablePool / MIN_ANONYMITY_SET;
+        uint256 callerPay = weiUsed > cap ? cap : weiUsed;
 
-        refundPerUser = (availablePool > callerReimbursement)
-            ? (availablePool - callerReimbursement) / MIN_ANONYMITY_SET
-            : 0;
+        (bool success, ) = payable(msg.sender).call{value: callerPay}("");
+        require(success, "Gas reimbursement failed");
 
-        uint256 leftoverContractBalance = computeLeftover(availablePool, actualUsed, refundPerUser);
+        /* ---------- update gas pool ---------- */
+        availablePool -= callerPay;   // what remains after reimbursing caller
 
-        if (leftoverContractBalance > 0) {
-            (bool sentToFeeRecipient, ) = payable(FEE_RECIPIENT).call{value: leftoverContractBalance, gas: 30000}("");
-            require(sentToFeeRecipient, "Leftover fee refund failed");
+        if (completedCount == MIN_ANONYMITY_SET) {
+            _finalizeBatch(batchId, availablePool, recipients);
+        } else {
+            // keep leftovers for retries
+            gasPoolForBatch[batchId] = availablePool;
         }
     }
 
-    function updateMerkleRoot() internal {
-        merkleRoot = computeMerkleRootFromPendingWithdrawals();
-        emit MerkleRootUpdated(merkleRoot);
-    }
 
-    function computeLeftover(uint256 pool, uint256 actualUsed, uint256 refundPerUser) internal pure returns (uint256) {
-        uint256 totalRefunds = refundPerUser * MIN_ANONYMITY_SET;
-        if (pool > actualUsed + totalRefunds) {
-            return pool - actualUsed - totalRefunds;
-        }
-        return 0;
-    }
-
-    function computeMerkleRootFromPendingWithdrawals() internal view returns (bytes32) {
-        uint256 maxLeaves = 128;
-        bytes32[] memory leaves = new bytes32[](maxLeaves);
-        uint256 j = 0;
-
-        for (uint256 i = 0; i < activeWithdrawalKeys.length && j < maxLeaves; i++) {
-            bytes32 key = activeWithdrawalKeys[i];
-            Withdrawal memory w = pendingWithdrawals[key];
-            if (
-                !processedWithdrawals[key] &&
-                w.retryCount < MAX_RETRY_ATTEMPTS &&
-                block.timestamp >= w.unlockTime &&
-                block.timestamp >= w.lastAttempt + RETRY_INTERVAL
-            ) {
-                leaves[j++] = keccak256(abi.encodePacked(key));
-            }
-        }
-
-        if (j == 0) return merkleRoot;
-
-        uint256 len = j;
-        while (len > 1) {
-            uint256 newLen = (len + 1) / 2;
-            for (uint256 i = 0; i < len - 1; i += 2) {
-                leaves[i / 2] = keccak256(abi.encodePacked(leaves[i], leaves[i + 1]));
-            }
-            if (len % 2 == 1) {
-                leaves[newLen - 1] = leaves[len - 1];
-            }
-            len = newLen;
-        }
-
-        return leaves[0];
-    }
 
     function updateGasHistory() internal {
-        gasPriceHistory[gasIndex] = tx.gasprice;
+        gasPriceHistory[gasIndex] = tx.gasprice < block.basefee ? block.basefee : tx.gasprice;
         unchecked {
             gasIndex = (gasIndex + 1) % GAS_HISTORY;
         }
+    }
+
+    function processWithdrawals() external nonReentrant {
+        _processWithdrawalsInternal();
     }
 
     function estimateGasCost() public view returns (uint256) {
@@ -363,40 +288,94 @@ contract ANONToken is ERC20, ReentrancyGuard {
         uint256 paddedGasPrice = ewmaGasPrice + (ewmaGasPrice / 8); // add 12.5% buffer
         uint256 usedGasPrice = tx.gasprice > paddedGasPrice ? tx.gasprice : paddedGasPrice;
 
-        return 300_000 * usedGasPrice;
+        return 375_000 * usedGasPrice;
     }
 
-    function secureRandomDelay(uint256 userInput) internal view returns (uint256) {
-        require(userInput > 0, "Entropy required");
+    function secureRandomDelay(bytes32 seed) internal view returns (uint256) {
+        // seed = commitmentHash (contains sender addr, burnId, timestamp, etc.)
+        bytes32 h = keccak256(
+            abi.encodePacked(
+                seed,
+                block.prevrandao,          // PoS randomness, unpredictable to user
+                block.timestamp,           // miner‑controlled but bounded
+                address(this)              // extra salt
+            )
+        );
+        return MIN_DELAY + (uint256(h) % (MAX_DELAY - MIN_DELAY));
+    }
 
-        bytes32 hash = keccak256(abi.encodePacked(
-            msg.sender,
-            merkleRoot,
-            block.prevrandao,
-            block.timestamp,
-            userInput,
-            blockhash(block.number - 1),
-            gasleft(),
-            tx.gasprice,
-            address(this)
-        ));
+    /* ---------- internal helpers to shrink stack ---------- */
+    function _msgHash(
+        address stealthRecip,
+        uint256 burnId,
+        address caller,
+        uint256 value,
+        uint256 entropy
+    ) internal view returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(
+                stealthRecip,
+                burnId,
+                caller,
+                address(this),
+                block.chainid,
+                value,
+                entropy
+            )
+        );
+    }
 
-        // Add iterative mixing with unique data per round
-        for (uint256 i = 0; i < 5; i++) {
-            hash = keccak256(abi.encodePacked(
-                hash,
-                blockhash(block.number - (i + 2)), // staggered previous blocks
-                block.timestamp + i,
-                gasleft(),
-                userInput,
-                i
-            ));
+    function _commitHash(
+        address stealthRecip,
+        uint256 burnId,
+        uint256 value,
+        uint256 entropy
+    ) internal view returns (bytes32) {
+        return keccak256(
+            abi.encodePacked(
+                stealthRecip,
+                burnId,
+                block.prevrandao,
+                block.timestamp,
+                value,
+                entropy,
+                block.chainid
+            )
+        );
+    }
+    function _finalizeBatch(
+        uint256 batchId,
+        uint256 availablePool,
+        address[] memory recipients
+    ) private {
+        // refund true surplus & clean queue
+        uint256 extraPerUser = availablePool / MIN_ANONYMITY_SET;
+        uint256 dust         = availablePool - (extraPerUser * MIN_ANONYMITY_SET);
+
+        for (uint256 i = 0; i < MIN_ANONYMITY_SET; i++) {
+            (bool refunded, ) = payable(recipients[i]).call{value: extraPerUser}("");
+            if (!refunded) {
+                (bool feeSent, ) = payable(FEE_RECIPIENT).call{value: extraPerUser, gas: 30_000}("");
+                require(feeSent, "Extra fee transfer failed");
+            }
+            delete withdrawalQueue[withdrawalStart + i];
+        }                           // ← closes the for-loop (ONLY ONE brace here)
+
+        delete activeWithdrawalKeys; // prune array
+
+        if (dust > 0) {
+            (bool dustSent, ) = payable(FEE_RECIPIENT).call{value: dust, gas: 30_000}("");
+            require(dustSent, "Dust transfer failed");
         }
 
-        return MIN_DELAY + (uint256(hash) % (MAX_DELAY - MIN_DELAY));
+        delete gasPoolForBatch[batchId];
+        withdrawalStart += MIN_ANONYMITY_SET;
+
     }
 
     function getRandomizedInterval() internal pure returns (uint256) {
         return BASE_PROCESS_TIME;
     }
+
+    
 }
